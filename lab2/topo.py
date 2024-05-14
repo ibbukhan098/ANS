@@ -64,35 +64,41 @@ class Jellyfish:
 		self.generate(num_servers, num_switches, num_ports)
 
 	def generate(self, num_servers, num_switches, num_ports):
-        	# Initialize switches
-			for i in range(num_switches):
-				self.switches.append(Node(f"switch-{i}", "switch"))
+		# Initialize switches
+		for i in range(num_switches):
+			self.switches.append(Node(f"switch-{i}", "switch"))
 
-			# Initialize servers
-			for i in range(num_servers):
-				self.servers.append(Node(f"server-{i}", "server"))
+		# Initialize servers
+		for i in range(num_servers):
+			self.servers.append(Node(f"server-{i}", "server"))
 
-			# Connect each switch with random links until all ports are used
-			available_switches = [s for s in self.switches if len(s.edges) < num_ports]
-			while available_switches:
-				s1 = random.choice(available_switches)
-				potential_s2 = [s for s in available_switches if s != s1 and not s1.is_neighbor(s)]
+		# Connect switches in a round-robin manner until all ports are used
+		switch_index = 0
+		available_switches = self.switches.copy()  # Make a copy to avoid modifying original list
+		while available_switches:
+			switch1 = available_switches[switch_index % len(available_switches)]  # Wrap around index
+			switch_index += 1  # Increment index
 
-				# Only proceed if there is at least one valid s2
-				if potential_s2:
-					s2 = random.choice(potential_s2)
-					s1.add_edge(s2)
-					# Update available_switches directly after adding an edge
-					if len(s1.edges) >= num_ports:
-						available_switches.remove(s1)
-					if len(s2.edges) >= num_ports:
-						available_switches.remove(s2)
-				else:
-					# Remove s1 from available_switches if no valid s2 can be found
-					available_switches.remove(s1)
+			# Randomly choose another switch if switch1 and switch2 are neighbors or if switch2 has already been removed
+			switch2 = random.choice(available_switches)
+			while switch2 == switch1 or switch2 not in available_switches:
+				switch2 = random.choice(available_switches)
 
-			# Re-check to ensure no switch exceeds its port limit (optional sanity check)
-			assert all(len(s.edges) <= num_ports for s in self.switches), "Some switches exceed port limit"
+			# Add an edge between switch1 and switch2
+			switch1.add_edge(switch2)
+
+			# Update available_switches after adding an edge
+			if len(switch1.edges) >= num_ports:
+				available_switches.remove(switch1)
+			if len(switch2.edges) >= num_ports:
+				available_switches.remove(switch2)
+
+		# Re-check to ensure no switch exceeds its port limit (optional sanity check)
+		assert all(len(s.edges) <= num_ports for s in self.switches), "Some switches exceed port limit"
+
+
+
+
 
 class Fattree:
 
