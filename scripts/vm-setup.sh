@@ -72,6 +72,7 @@ sudo apt-get install -y --no-install-recommends \
   xterm \
   git \
   mininet \
+  networkx \
   openvswitch-switch \
   openvswitch-common \
   vlc
@@ -79,6 +80,7 @@ sudo apt-get install -y --no-install-recommends \
 # Install Ryu network controller and Mininet packages
 sudo pip install ryu
 sudo pip install mininet
+sudo pip install networkx
 
 # Fix a compatability issue with eventlet
 sudo pip uninstall --yes eventlet
