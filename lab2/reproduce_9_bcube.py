@@ -21,19 +21,13 @@ matplotlib.use('Agg')  # Or 'Qt5Agg', 'GTK3Agg', etc., depending on what's insta
 import matplotlib.pyplot as plt
 import heapq
 
-# Setup for Jellyfish
-# num_servers = 686
-# num_switches = 245
-# num_ports = 14
+# Initialize BCube topology
+k = 1
+n = 4
 
-# Initialize Jellyfish topology
-num_switches = 245
-num_ports = 8
-num_servers = 686
+bcube_topo = topo.BCube(k,n)
 
-jf_topo = topo.Jellyfish(num_servers, num_switches, num_ports)
-
-# TODO: code for reproducing Figure 9 in the jellyfish paper
+# TODO: code for reproducing Figure 9 in the paper
 # Helper functions
 def dijkstra(start_node, nodes_dict):
     distances = {node_id: float('inf') for node_id in nodes_dict}
@@ -193,22 +187,22 @@ def dijkstra_path(graph, start, end):
     path = path[::-1]
     return path if path[0] == start else None
 
-# Create adjacency list from Jellyfish topology
+# Create adjacency list from BCube topology
 graph = {}
-for node in jf_topo.all_nodes:
+for node in bcube_topo.all_nodes:
     graph[node.id] = {}
-for node in jf_topo.all_nodes:
+for node in bcube_topo.all_nodes:
     for edge in node.edges:
         graph[edge.lnode.id][edge.rnode.id] = 1
         graph[edge.rnode.id][edge.lnode.id] = 1
 
 # Generate random permutation traffic
-servers = [node.id for node in jf_topo.servers]
+servers = [node.id for node in bcube_topo.servers]
 permutation = servers[:]
 random.shuffle(permutation)
 traffic_pairs = list(zip(servers, permutation))
 
-
+# Count link occurrences
 def count_link_occurrences(all_paths):
     link_occurrences = {}
     for path in all_paths:
@@ -225,7 +219,6 @@ all_paths_8_shortest = yen_k_shortest_paths(graph, traffic_pairs, 8)
 all_paths_8_ecmp = yen_k_ecmp_shortest_paths(graph, traffic_pairs, 8)
 all_paths_64_ecmp = yen_k_ecmp_shortest_paths(graph, traffic_pairs, 64)
 
-# Count link occurrences
 link_occurrences_8_shortest = count_link_occurrences(all_paths_8_shortest)
 link_occurrences_8_ecmp = count_link_occurrences(all_paths_8_ecmp)
 link_occurrences_64_ecmp = count_link_occurrences(all_paths_64_ecmp)
@@ -256,6 +249,6 @@ plt.step(range(1, len(ranked_links_8_shortest) + 1), ranked_occurrences_8_shorte
 
 plt.xlabel('Rank of Links')
 plt.ylabel('Number of Distinct Paths')
-plt.title('Number of Distinct Paths for Each Link')
+plt.title('b-cube-ecmp')
 plt.legend()
 plt.show()

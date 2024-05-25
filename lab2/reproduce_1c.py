@@ -7,7 +7,7 @@
 
       https://www.apache.org/licenses/LICENSE-2.0
 
- Unless required by applicable law or agreed to in writing, software
+ Unless required by applicable law or agreed to in writing, soft_topoware
  distributed under the License is distributed on an "AS IS" BASIS,
  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  See the License for the specific language governing permissions and
@@ -15,122 +15,129 @@
  """
  
 import matplotlib
-matplotlib.use('TkAgg')  # Or 'Qt5Agg', 'GTK3Agg', etc., depending on what's installed
+matplotlib.use('Agg')  # Or 'Qt5Agg', 'GTK3Agg', etc., depending on what's installed
 import matplotlib.pyplot as plt
-import numpy as np
-import random
 import heapq
+import time
+import topo
 import networkx as nx
 
-import topo
-
-# Same setup for Jellyfish and fat-tree
-num_servers = 686
-num_switches = 245
-num_ports = 14
-
-ft_topo = topo.Fattree(num_ports)
-jf_topo = topo.Jellyfish(num_servers, num_switches, num_ports)
-
-# TODO: code for reproducing Figure 1(c) in the jellyfish paper
 # Function to implement Dijkstra's shortest path algorithm
-def dijkstra(graph, start):
-    distances = {node: float('infinity') for node in graph}
-    distances[start] = 0
-    priority_queue = [(0, start)]
+def dijkstra(start_node, nodes_dict):
+    distances = {node_id: float('inf') for node_id in nodes_dict}
+    distances[start_node.id] = 0
+    priority_queue = [(0, start_node.id)]
+    visited = set()
 
     while priority_queue:
-        current_distance, current_node = heapq.heappop(priority_queue)
-
-        if current_distance > distances[current_node]:
+        current_distance, current_node_id = heapq.heappop(priority_queue)
+        if current_node_id in visited:
             continue
+        visited.add(current_node_id)
 
-        # Process each neighbor; graph[current_node] should be a dictionary
-        for neighbor, weight in graph[current_node].items():
-            distance = current_distance + weight
-            if distance < distances[neighbor]:
-                distances[neighbor] = distance
-                heapq.heappush(priority_queue, (distance, neighbor))
+        current_node = nodes_dict[current_node_id]
+
+        for edge in current_node.edges:
+            neighbor = edge.rnode if edge.lnode == current_node else edge.lnode
+            if neighbor.id not in visited:
+                distance = current_distance + 1
+                if distance < distances[neighbor.id]:
+                    distances[neighbor.id] = distance
+                    heapq.heappush(priority_queue, (distance, neighbor.id))
 
     return distances
 
-# Function to create a graph from topology data
-def create_graph(topology):
-    graph = {}
-    for node in topology.servers + topology.switches:
-        graph[node.id] = {}
-    for node in topology.servers + topology.switches:
-        for edge in node.edges:
-            neighbor = edge.rnode if edge.lnode == node else edge.lnode
-            graph[node.id][neighbor.id] = 1
-            graph[neighbor.id][node.id] = 1  # Ensure bidirectional connectivity for undirected graph
+# Initialize Fat-tree topology
+k = 4  # Fat-tree parameter
+ft_topo = topo.Fattree(k)
 
-    # Debugging output
-    # for node_id, connections in graph.items():
-    #     print(f"Node {node_id} connections: {len(connections)}")
-    return graph
+# Compute shortest paths for Fat-tree
+path_lengths_ft_topo = []
 
-# Create graphs
-ft_graph = create_graph(ft_topo)
-jf_graph = create_graph(jf_topo)
+start_time = time.time()
+for server1 in ft_topo.servers:
+    distances = dijkstra(server1, ft_topo.nodes)
+    for server2 in ft_topo.servers:
+        if server1 != server2:
+            path_length = distances.get(server2.id, float('inf'))
+            path_lengths_ft_topo.append(path_length)
+end_time = time.time()
+print(f"Fat-tree shortest paths computation took {end_time - start_time} seconds.")
 
-# Calculate shortest paths for all server pairs
-def calculate_path_lengths(graph):
-    path_lengths = {}
-    for server in graph:
-        # Pass the server ID, not the server object
-        path_lengths[server] = dijkstra(graph, server)
-        # print(f"Calculated path lengths from {server}: {path_lengths[server]}")
-    return path_lengths
+# Initialize Jellyfish topology parameters
+num_switches = 245
+num_ports = 14
+num_servers = 686
+num_trials = 10  # Number of trials for Jellyfish topology
 
-ft_paths = calculate_path_lengths(ft_graph)
-jf_paths = calculate_path_lengths(jf_graph)
+# Compute shortest paths for Jellyfish over multiple trials
+all_histograms_jf_topo = []
 
-# Calculate path length distributions
-def path_length_distribution(paths):
-    dist = {}
-    for start in paths:
-        for end, length in paths[start].items():
-            if length == float('inf'):
-                # print(f"Unreachable path from {start} to {end}")
-                continue
-            if length in dist:
-                dist[length] += 1
-            else:
-                dist[length] = 1
-    return dist
+for trial in range(num_trials):
+    print(f"Trial {trial + 1}/{num_trials} for Jellyfish topology")
+    jf_topo = topo.Jellyfish(num_switches, num_ports, num_servers)
+    path_lengths_jf_topo = []
 
-ft_dist = path_length_distribution(ft_paths)
-jf_dist = path_length_distribution(jf_paths)
+    start_time = time.time()
+    for server1 in jf_topo.servers:
+        distances = dijkstra(server1, {node.id: node for node in jf_topo.all_nodes})
+        for server2 in jf_topo.servers:
+            if server1 != server2:
+                path_length = distances.get(server2.id, float('inf'))
+                path_lengths_jf_topo.append(path_length)
+    end_time = time.time()
+    print(f"Jellyfish shortest paths computation for trial {trial + 1} took {end_time - start_time} seconds.")
 
-# Normalize distributions
-def normalize_distribution(dist, total_pairs):
-    for length in list(dist.keys()):  # Use list to avoid dictionary size change during iteration
-        if length == float('inf'):
-            del dist[length]  # Remove infinite lengths from distribution
-            continue
-        dist[length] /= total_pairs
-    return dist
+    # Create histogram for the current trial
+    max_length = max(path_lengths_jf_topo) if path_lengths_jf_topo else 0
+    histogram_jf_topo = [0] * (max_length + 1)
 
-total_pairs = num_servers * (num_servers - 1)  # Exclude self-pairs
-ft_dist = normalize_distribution(ft_dist, total_pairs)
-jf_dist = normalize_distribution(jf_dist, total_pairs)
+    for length in path_lengths_jf_topo:
+        histogram_jf_topo[length] += 1
+    
+    all_histograms_jf_topo.append(histogram_jf_topo)
 
-# Plotting
-print(ft_dist.keys(), ft_dist.values())
-print(jf_dist.keys(), jf_dist.values())
-plt.bar(ft_dist.keys(), ft_dist.values(), width=0.4, label='Fat-tree', alpha=0.6)
-plt.bar(jf_dist.keys(), jf_dist.values(), width=0.4, label='Jellyfish', alpha=0.6, color='r')
-plt.xlabel('Path Length')
-plt.ylabel('Fraction of Server Pairs')
-plt.title('Path Length Distribution')
-plt.legend()
+# Average the histograms over all trials
+max_length_jf = max(max(len(hist) for hist in all_histograms_jf_topo), max(path_lengths_ft_topo))
+average_histogram_jf_topo = [0] * (max_length_jf + 1)
+
+for hist in all_histograms_jf_topo:
+    for i, count in enumerate(hist):
+        average_histogram_jf_topo[i] += count
+
+average_histogram_jf_topo = [count / num_trials for count in average_histogram_jf_topo]
+
+# Prepare Fat-tree histogram
+max_length_ft = max(path_lengths_ft_topo)
+histogram_ft_topo = [0] * (max_length_ft + 1)
+
+for length in path_lengths_ft_topo:
+    histogram_ft_topo[length] += 1
+
+# Normalize the histograms to fractions of server pairs
+total_pairs_ft_topo = len(ft_topo.servers) * (len(ft_topo.servers) - 1)
+fractions_ft_topo = [count / total_pairs_ft_topo for count in histogram_ft_topo]
+
+total_pairs_jf_topo = len(jf_topo.servers) * (len(jf_topo.servers) - 1)
+fractions_jf_topo = [count / total_pairs_jf_topo for count in average_histogram_jf_topo]
+
+# Plotting the histograms in one plot
+# plt.figure(figsize=(12, 6))
+# plt.bar(range(len(fractions_ft_topo)), fractions_ft_topo, color='skyblue', alpha=0.7, label='Fat-tree')
+# plt.bar(range(len(fractions_jf_topo)), fractions_jf_topo, color='lightgreen', alpha=0.5, label='Jellyfish')
+
+# plt.xlabel('Path Length')
+# plt.ylabel('Fraction of Server Pairs')
+# plt.title('Shortest Path Length Distribution: Fat-tree vs. Jellyfish')
+# plt.legend()
+# plt.grid(True)
+# plt.savefig('images/reproduce_1c.png')  # Save the plot as a PNG file
+# plt.close()
+
+dcell_topo = topo.DCell
+G = nx.Graph()
+for node in dcell_topo.servers + dcell_topo.switches:
+    for edge in node.edges:
+        G.add_edge(edge.lnode.id, edge.rnode.id)
+nx.draw(G, with_labels=True)
 plt.show()
-# print(matplotlib.rcsetup.all_backends)
-
-# G = nx.Graph()
-# for node in ft_topo.servers + ft_topo.switches:
-#     for edge in node.edges:
-#         G.add_edge(edge.lnode.id, edge.rnode.id)
-# nx.draw(G, with_labels=True)
-# plt.show()
