@@ -19,104 +19,154 @@
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from ryu.controller.handler import set_ev_cls
+from ryu.lib.packet import packet, ethernet, ipv4, arp, ether_types
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ether_types, ipv4, arp
-from ryu.topology import event
+from ryu.topology import event, switches
 from ryu.topology.api import get_switch, get_link
-
-import networkx as nx
-import topo
+from collections import defaultdict, deque
+import heapq
 
 class SPRouter(app_manager.RyuApp):
-
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(SPRouter, self).__init__(*args, **kwargs)
-        self.topo_net = topo.Fattree(4)
-        self.graph = nx.Graph()
-        self.paths = {}
+        self.mac_to_port = {}
+        self.switches = {}
+        self.network = defaultdict(dict)
 
-    def get_topology_data(self):
-        switches = get_switch(None, None)
-        links = get_link(None, None)
-        return switches, links
+    # Topology discovery
+    @set_ev_cls(event.EventSwitchEnter)
+    def get_topology_data(self, ev):
+        switch_list = get_switch(self, None)
+        self.switches = {switch.dp.id: switch.dp for switch in switch_list}
+        links_list = get_link(self, None)
+        self.network = self.create_network(links_list)
 
-    def build_network_graph(self):
-        switches, links = self.get_topology_data()
-        self.graph.add_nodes_from([switch.dp.id for switch in switches])
-        for link in links:
-            self.graph.add_edge(link.src.dpid, link.dst.dpid)
+    def create_network(self, links_list):
+        graph = defaultdict(dict)
+        for link in links_list:
+            src = link.src.dpid
+            dst = link.dst.dpid
+            self.network[src][dst] = link.src.port_no
+        return graph
 
-    def calculate_shortest_paths(self):
-        self.paths = dict(nx.all_pairs_shortest_path(self.graph))
-
-    @staticmethod
-    def add_flow(datapath, priority, match, actions):
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst)
-        datapath.send_msg(mod)
-
-    @staticmethod
-    def handle_arp(datapath, in_port, pkt, arp_pkt):
-        src_ip = arp_pkt.src_ip
-        src_mac = arp_pkt.src_mac
-        SPRouter.topo_net.hosts[src_ip] = {'switch': datapath.id, 'port': in_port}
-
-    def handle_ipv4(self, datapath, in_port, pkt, ip_pkt):
-        dst_ip = ip_pkt.dst
-        src_ip = ip_pkt.src
-
-        if dst_ip in self.topo_net.hosts and src_ip in self.topo_net.hosts:
-            src_dpid = self.topo_net.hosts[src_ip]['switch']
-            dst_dpid = self.topo_net.hosts[dst_ip]['switch']
-            path = self.paths[src_dpid][dst_dpid][1:]  # Exclude source switch
-            out_port = self.graph[src_dpid][path[0]]['port']
-
-            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
-            match = datapath.ofproto_parser.OFPMatch(eth_type=0x0800, ipv4_dst=dst_ip)
-            self.add_flow(datapath, 1, match, actions)
-
-            data = None
-            if pkt.buffer_id == datapath.ofproto.OFP_NO_BUFFER:
-                data = pkt.data
-
-            out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=pkt.buffer_id,
-                                                       in_port=in_port, actions=actions, data=data)
-            datapath.send_msg(out)
-
-    @staticmethod
-    def handle_packet_in(msg):
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(packet.ethernet.ethernet)
-
-        if eth.ethertype == ether_types.ETH_TYPE_ARP:
-            arp_pkt = pkt.get_protocol(arp.arp)
-            SPRouter.handle_arp(msg.datapath, msg.match['in_port'], pkt, arp_pkt)
-
-        elif eth.ethertype == ether_types.ETH_TYPE_IP:
-            ip_pkt = pkt.get_protocol(ipv4.ipv4)
-            SPRouter.handle_ipv4(msg.datapath, msg.match['in_port'], pkt, ip_pkt)
-
-    @staticmethod
-    def switch_features_handler(event):
-        datapath = event.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
+        # Install the table-miss flow entry
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        SPRouter.add_flow(datapath, 0, match, actions)
+        self.add_flow(datapath, 0, match, actions)
 
-    @staticmethod
-    def event_switch_enter(event):
-        SPRouter.build_network_graph()
-        SPRouter.calculate_shortest_paths()
+    def add_flow(self, datapath, priority, match, actions, buffer_id=ofproto_v1_3.OFP_NO_BUFFER):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
 
-    @staticmethod
-    def packet_in_handler(event):
-        msg = event.msg
-        SPRouter.handle_packet_in(msg)
+        instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match,
+                                instructions=instructions, buffer_id=buffer_id,
+                                idle_timeout=30, hard_timeout=50, flags=ofproto.OFPFF_SEND_FLOW_REM)
+        datapath.send_msg(mod)
+
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+
+        # Determine the received port
+        in_port = msg.match['in_port']
+
+        # Learn a mac address to avoid FLOOD next time.
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][eth.src] = in_port
+
+        if eth.ethertype == ether_types.ETH_TYPE_IP:
+            ip_pkt = pkt.get_protocols(ipv4.ipv4)[0]
+            self.handle_ip_packet(datapath, in_port, eth, ip_pkt)
+        elif eth.ethertype == ether_types.ETH_TYPE_ARP:
+            arp_pkt = pkt.get_protocols(arp.arp)[0]
+            self.handle_arp_packet(datapath, in_port, eth, arp_pkt)
+
+    def find_shortest_path(self, src_dpid, dst_dpid):
+        # Dijkstra's algorithm
+        dist = {node: float('inf') for node in self.switches}
+        previous = {node: None for node in self.switches}
+        dist[src_dpid] = 0
+        pq = [(0, src_dpid)]
+
+        while pq:
+            current_distance, current_node = heapq.heappop(pq)
+
+            if current_distance > dist[current_node]:
+                continue
+
+            for neighbor in self.network[current_node]:
+                distance = current_distance + 1
+                if distance < dist[neighbor]:
+                    dist[neighbor] = distance
+                    previous[neighbor] = current_node
+                    heapq.heappush(pq, (distance, neighbor))
+
+        # Build the path
+        path = deque()
+        step = dst_dpid
+        while previous[step] is not None:
+            path.appendleft((previous[step], step))
+            step = previous[step]
+        return list(path)
+
+    def handle_ip_packet(self, datapath, in_port, eth, ip_pkt):
+        src = eth.src
+        dst = eth.dst
+
+        dst_dpid = None
+        for dpid, mac_table in self.mac_to_port.items():
+            if dst in mac_table:
+                dst_dpid = dpid
+                break
+
+        if dst_dpid:
+            path = self.find_shortest_path(datapath.id, dst_dpid)
+            self.install_path(datapath, path, in_port, eth, ip_pkt)
+
+    def handle_arp_packet(self, datapath, port, pkt_ethernet, pkt_arp):
+        if pkt_arp.opcode == arp.ARP_REQUEST:
+            # Generate an ARP reply
+            pkt = packet.Packet()
+            pkt.add_protocol(ethernet.ethernet(ethertype=pkt_ethernet.ethertype,
+                                            dst=pkt_ethernet.src,
+                                            src=self.arp_table[pkt_arp.dst_ip]))
+            pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                    src_mac=self.arp_table[pkt_arp.dst_ip],
+                                    src_ip=pkt_arp.dst_ip,
+                                    dst_mac=pkt_arp.src_mac,
+                                    dst_ip=pkt_arp.src_ip))
+            self.send_packet(datapath, port, pkt)
+
+
+    def install_path(self, datapath, path, in_port, eth, ip_pkt):
+        # Assuming the path is a list of tuples (src_dpid, dst_dpid)
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        for src_dpid, dst_dpid in path:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=eth.dst, eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=ip_pkt.dst)
+            actions = [parser.OFPActionOutput(self.network[src_dpid][dst_dpid])]
+            self.add_flow(self.switches[src_dpid], 100, match, actions)
+            in_port = self.network[dst_dpid][src_dpid]  # Reverse direction for the next hop
+
+# Start the controller application
+if __name__ == '__main__':
+    from ryu.cmd import manager
+    manager.main()

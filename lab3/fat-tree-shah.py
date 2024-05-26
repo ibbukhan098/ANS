@@ -26,7 +26,7 @@ class FattreeNet(Topo):
 
         # Add core switches
         cores = {}
-        for i in range(ft_topo.k // 2):
+        for i in range((ft_topo.k // 2) ** 2):
             core_switch = self.addSwitch(f"C{i+1}", dpid=f"{i+1}")
             cores[f"C{i+1}"] = core_switch
 
