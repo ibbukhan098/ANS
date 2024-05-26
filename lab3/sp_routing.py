@@ -35,8 +35,8 @@ class SPRouter(app_manager.RyuApp):
         self.mac_to_port = {}
         self.switches = {}
         self.network = defaultdict(dict)
+        self.arp_table = {}  # Pre-populated ARP table if needed
 
-    # Topology discovery
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
         switch_list = get_switch(self, None)
@@ -58,7 +58,7 @@ class SPRouter(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Install the table-miss flow entry
+        # Table-miss flow entry
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
@@ -66,107 +66,157 @@ class SPRouter(app_manager.RyuApp):
     def add_flow(self, datapath, priority, match, actions, buffer_id=ofproto_v1_3.OFP_NO_BUFFER):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
         instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match,
                                 instructions=instructions, buffer_id=buffer_id,
                                 idle_timeout=30, hard_timeout=50, flags=ofproto.OFPFF_SEND_FLOW_REM)
         datapath.send_msg(mod)
 
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
-        dpid = datapath.id
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+        in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
-        # Determine the received port
-        in_port = msg.match['in_port']
-
-        # Learn a mac address to avoid FLOOD next time.
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][eth.src] = in_port
-
         if eth.ethertype == ether_types.ETH_TYPE_IP:
             ip_pkt = pkt.get_protocols(ipv4.ipv4)[0]
-            self.handle_ip_packet(datapath, in_port, eth, ip_pkt)
+            self.handle_ip_packet(datapath, in_port, eth, ip_pkt, msg)  # Include msg as an argument
         elif eth.ethertype == ether_types.ETH_TYPE_ARP:
             arp_pkt = pkt.get_protocols(arp.arp)[0]
             self.handle_arp_packet(datapath, in_port, eth, arp_pkt)
 
-    def find_shortest_path(self, src_dpid, dst_dpid):
-        # Dijkstra's algorithm
-        dist = {node: float('inf') for node in self.switches}
-        previous = {node: None for node in self.switches}
-        dist[src_dpid] = 0
-        pq = [(0, src_dpid)]
 
-        while pq:
-            current_distance, current_node = heapq.heappop(pq)
+    def handle_ip_packet(self, datapath, in_port, eth, ip_pkt, msg):
+        dst_mac = eth.dst
 
-            if current_distance > dist[current_node]:
-                continue
+        # Initialize dpid in mac_to_port if not already done
+        self.mac_to_port.setdefault(datapath.id, {})
 
-            for neighbor in self.network[current_node]:
-                distance = current_distance + 1
-                if distance < dist[neighbor]:
-                    dist[neighbor] = distance
-                    previous[neighbor] = current_node
-                    heapq.heappush(pq, (distance, neighbor))
+        # Learning source MAC and port mapping
+        self.mac_to_port[datapath.id][eth.src] = in_port
 
-        # Build the path
-        path = deque()
-        step = dst_dpid
-        while previous[step] is not None:
-            path.appendleft((previous[step], step))
-            step = previous[step]
-        return list(path)
-
-    def handle_ip_packet(self, datapath, in_port, eth, ip_pkt):
-        src = eth.src
-        dst = eth.dst
-
-        dst_dpid = None
-        for dpid, mac_table in self.mac_to_port.items():
-            if dst in mac_table:
-                dst_dpid = dpid
-                break
-
-        if dst_dpid:
-            path = self.find_shortest_path(datapath.id, dst_dpid)
-            self.install_path(datapath, path, in_port, eth, ip_pkt)
-
-    def handle_arp_packet(self, datapath, port, pkt_ethernet, pkt_arp):
-        if pkt_arp.opcode == arp.ARP_REQUEST:
-            # Generate an ARP reply
-            pkt = packet.Packet()
-            pkt.add_protocol(ethernet.ethernet(ethertype=pkt_ethernet.ethertype,
-                                            dst=pkt_ethernet.src,
-                                            src=self.arp_table[pkt_arp.dst_ip]))
-            pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
-                                    src_mac=self.arp_table[pkt_arp.dst_ip],
-                                    src_ip=pkt_arp.dst_ip,
-                                    dst_mac=pkt_arp.src_mac,
-                                    dst_ip=pkt_arp.src_ip))
-            self.send_packet(datapath, port, pkt)
+        if dst_mac in self.mac_to_port[datapath.id]:
+            # Forward packet if destination MAC is known
+            self.forward_packet(datapath, in_port, eth, dst_mac, msg.data)
+        else:
+            # Flood if the MAC address is unknown
+            self.forward_packet(datapath, in_port, eth, None, msg.data)  # None indicates flood
 
 
-    def install_path(self, datapath, path, in_port, eth, ip_pkt):
-        # Assuming the path is a list of tuples (src_dpid, dst_dpid)
+    def handle_arp_packet(self, datapath, in_port, eth, arp_pkt):
+        src_ip = arp_pkt.src_ip
+        src_mac = arp_pkt.src_mac
+        dst_ip = arp_pkt.dst_ip
+
+        # Learn the source IP and MAC from ARP requests or replies
+        self.arp_table[src_ip] = src_mac
+
+        if arp_pkt.opcode == arp.ARP_REQUEST:
+            if dst_ip in self.arp_table:
+                # Send an ARP reply if we know the destination MAC
+                self.send_arp_reply(datapath, arp_pkt, eth.src, in_port)
+            else:
+                # Flood ARP request if no MAC address is known for the destination IP
+                self.flood_arp_request(datapath, in_port, eth, arp_pkt)
+
+
+                
+    def send_arp_reply(self, datapath, arp_pkt, eth_src):
+        src_ip = arp_pkt.dst_ip
+        dst_ip = arp_pkt.src_ip
+        src_mac = self.arp_table[src_ip]
+        dst_mac = eth_src  # Sender's MAC address
+
+        arp_reply_pkt = packet.Packet()
+        arp_reply_pkt.add_protocol(ethernet.ethernet(ethertype=ether_types.ETH_TYPE_ARP,
+                                                    dst=dst_mac, src=src_mac))
+        arp_reply_pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                        src_mac=src_mac, src_ip=src_ip,
+                                        dst_mac=dst_mac, dst_ip=dst_ip))
+        self.send_packet(datapath, arp_pkt.src_mac, arp_reply_pkt)  # Use arp_pkt.src_mac for the in_port
+
+        
+
+    def flood_arp_request(self, datapath, in_port, eth, arp_pkt):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        for src_dpid, dst_dpid in path:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=eth.dst, eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=ip_pkt.dst)
-            actions = [parser.OFPActionOutput(self.network[src_dpid][dst_dpid])]
-            self.add_flow(self.switches[src_dpid], 100, match, actions)
-            in_port = self.network[dst_dpid][src_dpid]  # Reverse direction for the next hop
 
-# Start the controller application
+        # Create a packet to flood the ARP request
+        pkt = packet.Packet()
+        pkt.add_protocol(ethernet.ethernet(ethertype=eth.ethertype,
+                                        dst='ff:ff:ff:ff:ff:ff',  # Broadcast MAC address
+                                        src=eth.src))
+        pkt.add_protocol(arp_pkt)
+        pkt.serialize()
+
+        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+                                in_port=in_port, actions=actions, data=pkt.data)
+        datapath.send_msg(out)
+
+
+
+    def send_arp_reply(self, datapath, arp_pkt, eth_src, in_port):
+        src_ip = arp_pkt.dst_ip
+        dst_ip = arp_pkt.src_ip
+        src_mac = self.arp_table[src_ip]
+        dst_mac = eth_src
+
+        arp_reply_pkt = packet.Packet()
+        arp_reply_pkt.add_protocol(ethernet.ethernet(ethertype=ether_types.ETH_TYPE_ARP,
+                                                    dst=dst_mac, src=src_mac))
+        arp_reply_pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                        src_mac=src_mac, src_ip=src_ip,
+                                        dst_mac=dst_mac, dst_ip=dst_ip))
+        self.send_packet(datapath, in_port, arp_reply_pkt)
+
+
+    def send_packet(self, datapath, port, pkt):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        pkt.serialize()  # Ensure packet is serialized before sending
+        data = pkt.data
+        actions = [parser.OFPActionOutput(port)]
+
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+                                in_port=ofproto.OFPP_CONTROLLER, actions=actions, data=data)
+        datapath.send_msg(out)
+
+
+    def forward_packet(self, datapath, in_port, eth, dst_mac, data):
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # Check if destination MAC is known
+        if dst_mac and dst_mac in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst_mac]
+        else:
+            # If unknown, flood within the local network segment
+            out_port = ofproto.OFPP_FLOOD
+
+        # Prepare the action
+        actions = [parser.OFPActionOutput(out_port)]
+
+        # Install a flow to prevent packet_in next time if not flooding
+        if out_port != ofproto.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
+            self.add_flow(datapath, 1, match, actions)
+
+        # Send packet out the designated port
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+                                in_port=in_port, actions=actions, data=data)
+        datapath.send_msg(out)
+
+
+
+
+
+
 if __name__ == '__main__':
     from ryu.cmd import manager
     manager.main()
