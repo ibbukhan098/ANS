@@ -16,6 +16,7 @@
 
 #!/usr/bin/env python3
 
+import logging
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -25,17 +26,27 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event, switches
 from ryu.topology.api import get_switch, get_link
 from collections import defaultdict, deque
-import heapq
+
+import network_awareness
+import network_monitor
+import setting
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
 class SPRouter(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {
+		"network_awareness": network_awareness.NetworkAwareness,
+		"network_monitor": network_monitor.NetworkMonitor}
+    WEIGHT_MODEL = {'hop': 'weight', 'bw': 'bw'}
 
     def __init__(self, *args, **kwargs):
         super(SPRouter, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.switches = {}
         self.network = defaultdict(dict)
-        self.arp_table = {}  # Pre-populated ARP table if needed
+        self.arp_table = {}  # ARP table for IP to MAC resolution
 
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
@@ -43,6 +54,7 @@ class SPRouter(app_manager.RyuApp):
         self.switches = {switch.dp.id: switch.dp for switch in switch_list}
         links_list = get_link(self, None)
         self.network = self.create_network(links_list)
+        logging.info("Topology data acquired: %s", self.network)
 
     def create_network(self, links_list):
         graph = defaultdict(dict)
@@ -57,11 +69,10 @@ class SPRouter(app_manager.RyuApp):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        # Table-miss flow entry
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+        logging.info("Table-miss flow entry installed for switch %s", datapath.id)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=ofproto_v1_3.OFP_NO_BUFFER):
         ofproto = datapath.ofproto
@@ -71,151 +82,103 @@ class SPRouter(app_manager.RyuApp):
                                 instructions=instructions, buffer_id=buffer_id,
                                 idle_timeout=30, hard_timeout=50, flags=ofproto.OFPFF_SEND_FLOW_REM)
         datapath.send_msg(mod)
+        logging.info("Flow added with priority %s on switch %s for match %s", priority, datapath.id, match)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
         in_port = msg.match['in_port']
-
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
         if eth.ethertype == ether_types.ETH_TYPE_IP:
             ip_pkt = pkt.get_protocols(ipv4.ipv4)[0]
-            self.handle_ip_packet(datapath, in_port, eth, ip_pkt, msg)  # Include msg as an argument
+            self.handle_ip_packet(datapath, in_port, eth, ip_pkt, msg)
         elif eth.ethertype == ether_types.ETH_TYPE_ARP:
             arp_pkt = pkt.get_protocols(arp.arp)[0]
             self.handle_arp_packet(datapath, in_port, eth, arp_pkt)
 
-
     def handle_ip_packet(self, datapath, in_port, eth, ip_pkt, msg):
         dst_mac = eth.dst
-
-        # Initialize dpid in mac_to_port if not already done
         self.mac_to_port.setdefault(datapath.id, {})
-
-        # Learning source MAC and port mapping
         self.mac_to_port[datapath.id][eth.src] = in_port
+        logging.info("Handling IP packet: %s -> %s on switch %s", eth.src, eth.dst, datapath.id)
 
         if dst_mac in self.mac_to_port[datapath.id]:
-            # Forward packet if destination MAC is known
             self.forward_packet(datapath, in_port, eth, dst_mac, msg.data)
         else:
-            # Flood if the MAC address is unknown
-            self.forward_packet(datapath, in_port, eth, None, msg.data)  # None indicates flood
-
+            self.forward_packet(datapath, in_port, eth, None, msg.data)
 
     def handle_arp_packet(self, datapath, in_port, eth, arp_pkt):
         src_ip = arp_pkt.src_ip
         src_mac = arp_pkt.src_mac
         dst_ip = arp_pkt.dst_ip
-
-        # Learn the source IP and MAC from ARP requests or replies
         self.arp_table[src_ip] = src_mac
+        logging.info("Handling ARP packet from %s to %s on switch %s", src_ip, dst_ip, datapath.id)
 
         if arp_pkt.opcode == arp.ARP_REQUEST:
             if dst_ip in self.arp_table:
-                # Send an ARP reply if we know the destination MAC
                 self.send_arp_reply(datapath, arp_pkt, eth.src, in_port)
             else:
-                # Flood ARP request if no MAC address is known for the destination IP
                 self.flood_arp_request(datapath, in_port, eth, arp_pkt)
-
-
-                
-    def send_arp_reply(self, datapath, arp_pkt, eth_src):
-        src_ip = arp_pkt.dst_ip
-        dst_ip = arp_pkt.src_ip
-        src_mac = self.arp_table[src_ip]
-        dst_mac = eth_src  # Sender's MAC address
-
-        arp_reply_pkt = packet.Packet()
-        arp_reply_pkt.add_protocol(ethernet.ethernet(ethertype=ether_types.ETH_TYPE_ARP,
-                                                    dst=dst_mac, src=src_mac))
-        arp_reply_pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
-                                        src_mac=src_mac, src_ip=src_ip,
-                                        dst_mac=dst_mac, dst_ip=dst_ip))
-        self.send_packet(datapath, arp_pkt.src_mac, arp_reply_pkt)  # Use arp_pkt.src_mac for the in_port
-
-        
-
-    def flood_arp_request(self, datapath, in_port, eth, arp_pkt):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        # Create a packet to flood the ARP request
-        pkt = packet.Packet()
-        pkt.add_protocol(ethernet.ethernet(ethertype=eth.ethertype,
-                                        dst='ff:ff:ff:ff:ff:ff',  # Broadcast MAC address
-                                        src=eth.src))
-        pkt.add_protocol(arp_pkt)
-        pkt.serialize()
-
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
-                                in_port=in_port, actions=actions, data=pkt.data)
-        datapath.send_msg(out)
-
-
 
     def send_arp_reply(self, datapath, arp_pkt, eth_src, in_port):
         src_ip = arp_pkt.dst_ip
         dst_ip = arp_pkt.src_ip
         src_mac = self.arp_table[src_ip]
         dst_mac = eth_src
-
         arp_reply_pkt = packet.Packet()
         arp_reply_pkt.add_protocol(ethernet.ethernet(ethertype=ether_types.ETH_TYPE_ARP,
                                                     dst=dst_mac, src=src_mac))
         arp_reply_pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
-                                        src_mac=src_mac, src_ip=src_ip,
-                                        dst_mac=dst_mac, dst_ip=dst_ip))
+                                           src_mac=src_mac, src_ip=src_ip,
+                                           dst_mac=dst_mac, dst_ip=dst_ip))
         self.send_packet(datapath, in_port, arp_reply_pkt)
+        logging.info("ARP reply sent from %s to %s on switch %s", src_ip, dst_ip, datapath.id)
 
+    def flood_arp_request(self, datapath, in_port, eth, arp_pkt):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        pkt = packet.Packet()
+        pkt.add_protocol(ethernet.ethernet(ethertype=eth.ethertype,
+                                           dst='ff:ff:ff:ff:ff:ff',  # Broadcast MAC address
+                                           src=eth.src))
+        pkt.add_protocol(arp_pkt)
+        pkt.serialize()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=in_port, actions=actions, data=pkt.data)
+        datapath.send_msg(out)
+        logging.info("ARP request flooded on switch %s", datapath.id)
 
     def send_packet(self, datapath, port, pkt):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        pkt.serialize()  # Ensure packet is serialized before sending
+        pkt.serialize()
         data = pkt.data
         actions = [parser.OFPActionOutput(port)]
-
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
-                                in_port=ofproto.OFPP_CONTROLLER, actions=actions, data=data)
+                                  in_port=ofproto.OFPP_CONTROLLER, actions=actions, data=data)
         datapath.send_msg(out)
-
+        logging.info("Packet sent through port %s on switch %s", port, datapath.id)
 
     def forward_packet(self, datapath, in_port, eth, dst_mac, data):
         dpid = datapath.id
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        # Check if destination MAC is known
         if dst_mac and dst_mac in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst_mac]
         else:
-            # If unknown, flood within the local network segment
             out_port = ofproto.OFPP_FLOOD
-
-        # Prepare the action
         actions = [parser.OFPActionOutput(out_port)]
-
-        # Install a flow to prevent packet_in next time if not flooding
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
             self.add_flow(datapath, 1, match, actions)
-
-        # Send packet out the designated port
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
-                                in_port=in_port, actions=actions, data=data)
+                                  in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
-
-
-
-
-
+        logging.info("Forwarding packet: %s -> %s on switch %s via port %s", eth.src, eth.dst, dpid, out_port)
 
 if __name__ == '__main__':
     from ryu.cmd import manager
