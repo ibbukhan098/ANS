@@ -100,7 +100,7 @@ class Fattree(Topo):
     """
     Add Link
     """
-    def createLink(self, bw_c2a=0.2, bw_a2e=0.1, bw_h2a=0.5):
+    def createLink(self):
         logger.debug("Add link Core to Agg.")
         end = self.pod/2
         for x in range(0, self.iAggLayerSwitch, int(end)):
@@ -109,7 +109,7 @@ class Fattree(Topo):
                     self.addLink(
                         self.CoreSwitchList[int(i*end+j)],
                         self.AggSwitchList[x+i],
-                        bw=bw_c2a)
+                        bw=15, delay='5ms')
 
         logger.debug("Add link Agg to Edge.")
         for x in range(0, self.iAggLayerSwitch, int(end)):
@@ -117,7 +117,7 @@ class Fattree(Topo):
                 for j in range(0, int(end)):
                     self.addLink(
                         self.AggSwitchList[x+i], self.EdgeSwitchList[x+j],
-                        bw=bw_a2e)
+                        bw=15, delay='5ms')
 
         logger.debug("Add link Edge to Host.")
         for x in range(0, int(self.iEdgeLayerSwitch)):
@@ -125,7 +125,7 @@ class Fattree(Topo):
                 self.addLink(
                     self.EdgeSwitchList[x],
                     self.HostList[self.density * x + i],
-                    bw=bw_h2a)
+                    bw=15, delay='5ms')
 
     def set_ovs_protocol_13(self,):
         self._set_ovs_protocol_13(self.CoreSwitchList)
@@ -161,11 +161,11 @@ def pingTest(net):
     net.pingAll()
 
 
-def createTopo(pod, density, ip="127.0.0.1", port=6633, bw_c2a=0.2, bw_a2e=0.1, bw_h2a=0.05):
+def createTopo(pod, density, ip="127.0.0.1", port=6633):
     logging.debug("LV1 Create Fattree")
     topo = Fattree(pod, density)
     topo.createTopo()
-    topo.createLink(bw_c2a=bw_c2a, bw_a2e=bw_a2e, bw_h2a=bw_h2a)
+    topo.createLink()
 
     logging.debug("LV1 Start Mininet")
     CONTROLLER_IP = ip
